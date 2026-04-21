@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Env & secrets
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+
+# Tests / caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Project data
+chroma_db/
+!chroma_db/.gitkeep
+uploads/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
