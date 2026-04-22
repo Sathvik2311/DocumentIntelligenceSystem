@@ -3,8 +3,8 @@
 Usage:
     python ingest.py <file_path>
 
-Day 2: prints parse/chunk summary.
-Day 3 will extend this to embed + persist to ChromaDB.
+Parses the file, chunks it, embeds each chunk with sentence-transformers,
+and upserts the chunks into the ChromaDB collection at CHROMA_PERSIST_DIR.
 """
 
 from __future__ import annotations
@@ -14,31 +14,28 @@ import logging
 import sys
 
 from backend.config import get_settings
-from backend.services.ingestion import ingest_file
+from backend.services.ingestion import get_collection, ingest_document
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Ingest a document.")
+    parser = argparse.ArgumentParser(description="Ingest a document into ChromaDB.")
     parser.add_argument("path", help="Path to a PDF, DOCX, or TXT file.")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=get_settings().log_level, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=get_settings().log_level,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
-    chunks = ingest_file(args.path)
-    if not chunks:
-        print(f"No chunks produced from {args.path} (empty or unreadable).")
-        return 1
+    result = ingest_document(args.path)
+    collection_total = get_collection().count()
 
-    first = chunks[0]
-    print(f"File:       {first.filename}")
-    print(f"Doc ID:     {first.doc_id}")
-    print(f"Chunks:     {len(chunks)}")
-    print(f"Pages seen: {len({c.page_number for c in chunks})}")
-    print(f"Tokens/chk: min={min(c.token_count for c in chunks)} "
-          f"max={max(c.token_count for c in chunks)}")
-    print(f"\n--- First chunk (page {first.page_number}, idx {first.chunk_index}) ---")
-    print(first.text[:400] + ("..." if len(first.text) > 400 else ""))
-    return 0
+    print(f"File:              {result.filename}")
+    print(f"Doc ID:            {result.doc_id}")
+    print(f"Pages parsed:      {result.num_pages}")
+    print(f"Chunks stored:     {result.num_chunks}")
+    print(f"Collection total:  {collection_total}")
+    return 0 if result.num_chunks > 0 else 1
 
 
 if __name__ == "__main__":

@@ -1,8 +1,4 @@
-"""Ingestion pipeline: parse documents and chunk them into token-bounded pieces.
-
-Day 2 scope: parsing (PDF/DOCX/TXT) + token-based chunking with overlap.
-Embedding + ChromaDB persistence land in Day 3.
-"""
+"""Ingestion pipeline: parse, chunk, embed, and persist documents to ChromaDB."""
 
 from __future__ import annotations
 
@@ -11,19 +7,27 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import chromadb
 import pymupdf
 import tiktoken
+from chromadb.api.models.Collection import Collection
 from docx import Document as DocxDocument
+from sentence_transformers import SentenceTransformer
 
 from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+COLLECTION_NAME = "documents"
+_EMBEDDER: SentenceTransformer | None = None
+_CHROMA_CLIENT: chromadb.api.ClientAPI | None = None
+_COLLECTION: Collection | None = None
+
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class ParsedPage:
     """A single page of parsed text."""
 
@@ -31,7 +35,7 @@ class ParsedPage:
     page_number: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class DocumentChunk:
     """A token-bounded chunk ready for embedding."""
 
@@ -44,22 +48,17 @@ class DocumentChunk:
 
     def metadata(self) -> dict[str, str | int]:
         """ChromaDB-compatible metadata dict (scalar values only)."""
-        return {
-            "doc_id": self.doc_id,
-            "filename": self.filename,
-            "page_number": self.page_number,
-            "chunk_index": self.chunk_index,
-            "token_count": self.token_count,
-        }
+        return {"doc_id": self.doc_id, "filename": self.filename, "page_number": self.page_number,
+            "chunk_index": self.chunk_index, "token_count": self.token_count, }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class ParsedDocument:
     """A parsed document with identity and page list."""
 
     doc_id: str
     filename: str
-    pages: list[ParsedPage] = field(default_factory=list)
+    pages: list[ParsedPage] = field(default_factory = list)
 
 
 def parse_document(path: str | Path, doc_id: str | None = None) -> ParsedDocument:
@@ -75,9 +74,7 @@ def parse_document(path: str | Path, doc_id: str | None = None) -> ParsedDocumen
 
     ext = p.suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
-        raise ValueError(
-            f"Unsupported extension {ext!r}; expected one of {sorted(SUPPORTED_EXTENSIONS)}"
-        )
+        raise ValueError(f"Unsupported extension {ext!r}; expected one of {sorted(SUPPORTED_EXTENSIONS)}")
 
     if ext == ".pdf":
         pages = _parse_pdf(p)
@@ -86,20 +83,16 @@ def parse_document(path: str | Path, doc_id: str | None = None) -> ParsedDocumen
     else:
         pages = _parse_txt(p)
 
-    return ParsedDocument(
-        doc_id=doc_id or uuid.uuid4().hex,
-        filename=p.name,
-        pages=pages,
-    )
+    return ParsedDocument(doc_id = doc_id or uuid.uuid4().hex, filename = p.name, pages = pages, )
 
 
 def _parse_pdf(path: Path) -> list[ParsedPage]:
     pages: list[ParsedPage] = []
     with pymupdf.open(path) as doc:
-        for i, page in enumerate(doc, start=1):
+        for i, page in enumerate(doc, start = 1):
             text = page.get_text("text").strip()
             if text:
-                pages.append(ParsedPage(text=text, page_number=i))
+                pages.append(ParsedPage(text = text, page_number = i))
     return pages
 
 
@@ -109,19 +102,16 @@ def _parse_docx(path: Path) -> list[ParsedPage]:
     # page-level granularity for DOCX inputs.
     doc = DocxDocument(str(path))
     text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    return [ParsedPage(text=text, page_number=1)] if text else []
+    return [ParsedPage(text = text, page_number = 1)] if text else []
 
 
 def _parse_txt(path: Path) -> list[ParsedPage]:
-    text = path.read_text(encoding="utf-8", errors="replace").strip()
-    return [ParsedPage(text=text, page_number=1)] if text else []
+    text = path.read_text(encoding = "utf-8", errors = "replace").strip()
+    return [ParsedPage(text = text, page_number = 1)] if text else []
 
 
-def chunk_document(
-    document: ParsedDocument,
-    chunk_size: int | None = None,
-    chunk_overlap: int | None = None,
-) -> list[DocumentChunk]:
+def chunk_document(document: ParsedDocument, chunk_size: int | None = None, chunk_overlap: int | None = None, ) -> list[
+    DocumentChunk]:
     """Split a parsed document into token-bounded chunks with overlap.
 
     Chunks never cross page boundaries, so each chunk carries the page number
@@ -145,34 +135,86 @@ def chunk_document(
         if not tokens:
             continue
         for start in range(0, len(tokens), step):
-            window = tokens[start : start + size]
+            window = tokens[start: start + size]
             if not window:
                 break
             chunks.append(
-                DocumentChunk(
-                    text=_ENCODING.decode(window),
-                    doc_id=document.doc_id,
-                    filename=document.filename,
-                    page_number=page.page_number,
-                    chunk_index=global_index,
-                    token_count=len(window),
-                )
-            )
+                DocumentChunk(text = _ENCODING.decode(window), doc_id = document.doc_id, filename = document.filename,
+                    page_number = page.page_number, chunk_index = global_index, token_count = len(window), ))
             global_index += 1
             if start + size >= len(tokens):
                 break
 
-    logger.info(
-        "Chunked %s: %d pages -> %d chunks (size=%d overlap=%d)",
-        document.filename,
-        len(document.pages),
-        len(chunks),
-        size,
-        overlap,
-    )
+    logger.info("Chunked %s: %d pages -> %d chunks (size=%d overlap=%d)", document.filename, len(document.pages),
+        len(chunks), size, overlap, )
     return chunks
 
 
 def ingest_file(path: str | Path) -> list[DocumentChunk]:
-    """Parse + chunk a file in one call. Convenience wrapper for Day 2."""
+    """Parse + chunk a file in one call (no persistence)."""
     return chunk_document(parse_document(path))
+
+
+@dataclass(frozen = True)
+class IngestResult:
+    """Outcome of a full parse -> chunk -> embed -> persist cycle."""
+
+    doc_id: str
+    filename: str
+    num_pages: int
+    num_chunks: int
+
+
+def get_embedder() -> SentenceTransformer:
+    """Lazily load and cache the sentence-transformers model."""
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        name = get_settings().embedding_model
+        logger.info("Loading embedding model: %s", name)
+        _EMBEDDER = SentenceTransformer(name)
+    return _EMBEDDER
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts. Returns plain Python lists for Chroma."""
+    if not texts:
+        return []
+    vectors = get_embedder().encode(texts, convert_to_numpy = True, show_progress_bar = False,
+        normalize_embeddings = True, )
+    return vectors.tolist()
+
+
+def get_collection() -> Collection:
+    """Return the shared ChromaDB collection, creating it if needed."""
+    global _CHROMA_CLIENT, _COLLECTION
+    if _COLLECTION is None:
+        settings = get_settings()
+        Path(settings.chroma_persist_dir).mkdir(parents = True, exist_ok = True)
+        _CHROMA_CLIENT = chromadb.PersistentClient(path = settings.chroma_persist_dir)
+        _COLLECTION = _CHROMA_CLIENT.get_or_create_collection(name = COLLECTION_NAME,
+            metadata = {"hnsw:space": "cosine"}, )
+    return _COLLECTION
+
+
+def store_chunks(chunks: list[DocumentChunk]) -> int:
+    """Embed and persist chunks. Returns the number stored."""
+    if not chunks:
+        return 0
+
+    ids = [f"{c.doc_id}:{c.chunk_index}" for c in chunks]
+    documents = [c.text for c in chunks]
+    metadatas = [c.metadata() for c in chunks]
+    embeddings = embed_texts(documents)
+
+    get_collection().upsert(ids = ids, embeddings = embeddings, documents = documents, metadatas = metadatas, )
+    logger.info("Stored %d chunks for %s", len(chunks), chunks[0].filename)
+    return len(chunks)
+
+
+def ingest_document(path: str | Path, doc_id: str | None = None) -> IngestResult:
+    """Full pipeline: parse -> chunk -> embed -> persist."""
+    parsed = parse_document(path, doc_id = doc_id)
+    chunks = chunk_document(parsed)
+    stored = store_chunks(chunks)
+    return IngestResult(doc_id = parsed.doc_id, filename = parsed.filename, num_pages = len(parsed.pages),
+        num_chunks = stored, )
