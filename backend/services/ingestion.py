@@ -218,3 +218,57 @@ def ingest_document(path: str | Path, doc_id: str | None = None) -> IngestResult
     stored = store_chunks(chunks)
     return IngestResult(doc_id = parsed.doc_id, filename = parsed.filename, num_pages = len(parsed.pages),
         num_chunks = stored, )
+
+
+@dataclass(frozen=True)
+class DocumentSummary:
+    """Aggregated view of a single document in the corpus."""
+
+    doc_id: str
+    filename: str
+    num_chunks: int
+    num_pages: int
+
+
+def list_documents() -> list[DocumentSummary]:
+    """Return one summary per ingested document, sorted by filename."""
+    collection = get_collection()
+    if collection.count() == 0:
+        return []
+
+    rows = collection.get(include=["metadatas"])
+    by_doc: dict[str, dict] = {}
+    for meta in rows["metadatas"] or []:
+        doc_id = str(meta.get("doc_id", ""))
+        if not doc_id:
+            continue
+        entry = by_doc.setdefault(
+            doc_id,
+            {"filename": str(meta.get("filename", "")), "chunks": 0, "max_page": 0},
+        )
+        entry["chunks"] += 1
+        entry["max_page"] = max(entry["max_page"], int(meta.get("page_number", 0)))
+
+    summaries = [
+        DocumentSummary(
+            doc_id=doc_id,
+            filename=v["filename"],
+            num_chunks=v["chunks"],
+            num_pages=v["max_page"],
+        )
+        for doc_id, v in by_doc.items()
+    ]
+    summaries.sort(key=lambda s: (s.filename, s.doc_id))
+    return summaries
+
+
+def delete_document(doc_id: str) -> int:
+    """Delete every chunk belonging to `doc_id`. Returns the number deleted."""
+    collection = get_collection()
+    existing = collection.get(where={"doc_id": doc_id}, include=[])
+    n = len(existing.get("ids", []) or [])
+    if n == 0:
+        return 0
+    collection.delete(where={"doc_id": doc_id})
+    logger.info("Deleted %d chunks for doc_id=%s", n, doc_id)
+    return n
