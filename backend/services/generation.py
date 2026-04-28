@@ -1,12 +1,18 @@
-"""Generation service: build a grounded prompt from retrieved chunks and call Anthropic."""
+"""Generation service: build a grounded prompt from retrieved chunks and call an LLM.
+
+The active LLM provider is selected by the LLM_PROVIDER env var (ollama | gemini |
+anthropic). Each provider implements a tiny `complete(system, user)` interface and
+is lazily imported so unused providers don't crash on missing creds.
+"""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Protocol
 
-from anthropic import Anthropic
+import httpx
 
 from backend.config import get_settings
 from backend.services.retrieval import RetrievedChunk
@@ -54,15 +60,143 @@ class Answer:
     output_tokens: int
 
 
-@lru_cache(maxsize=1)
-def _get_client() -> Anthropic:
-    """Lazily build a single Anthropic client (uses ANTHROPIC_API_KEY from env)."""
-    settings = get_settings()
-    if not settings.anthropic_api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Add it to .env before calling generate_answer()."
+# ---------- Provider abstraction ----------
+
+
+@dataclass(frozen=True)
+class ProviderResponse:
+    """A single completion result from any LLM provider."""
+
+    text: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+
+
+class _Provider(Protocol):
+    def complete(self, system: str, user: str) -> ProviderResponse: ...
+
+
+class _OllamaProvider:
+    """Local Ollama via the native /api/chat endpoint. No SDK; uses httpx."""
+
+    def complete(self, system: str, user: str) -> ProviderResponse:
+        s = get_settings()
+        url = f"{s.ollama_base_url.rstrip('/')}/api/chat"
+        payload = {
+            "model": s.ollama_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "options": {"num_predict": _MAX_OUTPUT_TOKENS},
+        }
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                r = client.post(url, json=payload)
+                r.raise_for_status()
+        except httpx.ConnectError as exc:
+            raise RuntimeError(
+                f"Could not reach Ollama at {s.ollama_base_url}. "
+                f"Is `ollama serve` running and have you pulled `{s.ollama_model}` "
+                f"with `ollama pull {s.ollama_model}`?"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Ollama returned {exc.response.status_code}: {exc.response.text[:200]}"
+            ) from exc
+
+        data = r.json()
+        text = (data.get("message") or {}).get("content", "").strip()
+        return ProviderResponse(
+            text=text,
+            model=data.get("model", s.ollama_model),
+            input_tokens=int(data.get("prompt_eval_count", 0)),
+            output_tokens=int(data.get("eval_count", 0)),
         )
-    return Anthropic(api_key=settings.anthropic_api_key)
+
+
+class _GeminiProvider:
+    """Google Gemini via google-generativeai SDK."""
+
+    def complete(self, system: str, user: str) -> ProviderResponse:
+        import google.generativeai as genai  # lazy import
+
+        s = get_settings()
+        if not s.gemini_api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Add it to .env or switch LLM_PROVIDER."
+            )
+        genai.configure(api_key=s.gemini_api_key)
+        model = genai.GenerativeModel(model_name=s.gemini_model)
+
+        response = model.generate_content(
+            [system, user],
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=_MAX_OUTPUT_TOKENS
+            ),
+        )
+        text = response.text.strip() if response.text else ""
+
+        # Gemini SDK returns usage_metadata when available.
+        input_tokens = output_tokens = 0
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+            output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+
+        return ProviderResponse(
+            text=text,
+            model=s.gemini_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+
+class _AnthropicProvider:
+    """Anthropic Claude via the anthropic SDK."""
+
+    def complete(self, system: str, user: str) -> ProviderResponse:
+        from anthropic import Anthropic  # lazy import
+
+        s = get_settings()
+        if not s.anthropic_api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is not set. Add it to .env or switch LLM_PROVIDER."
+            )
+        client = Anthropic(api_key=s.anthropic_api_key)
+
+        response = client.messages.create(
+            model=s.anthropic_model,
+            max_tokens=_MAX_OUTPUT_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = "".join(b.text for b in response.content if b.type == "text").strip()
+        return ProviderResponse(
+            text=text,
+            model=response.model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+
+
+@lru_cache(maxsize=1)
+def _get_provider() -> _Provider:
+    """Pick the active provider based on LLM_PROVIDER. Cached for the process lifetime."""
+    name = get_settings().llm_provider
+    logger.info("Using LLM provider: %s", name)
+    if name == "ollama":
+        return _OllamaProvider()
+    if name == "gemini":
+        return _GeminiProvider()
+    if name == "anthropic":
+        return _AnthropicProvider()
+    raise RuntimeError(f"Unknown LLM_PROVIDER: {name!r}")
+
+
+# ---------- Prompt building (provider-agnostic) ----------
 
 
 def _format_context(chunks: list[RetrievedChunk]) -> str:
@@ -96,55 +230,50 @@ def _chunks_to_citations(chunks: list[RetrievedChunk]) -> list[Citation]:
     ]
 
 
-def generate_answer(question: str, chunks: list[RetrievedChunk]) -> Answer:
-    """Call the Anthropic API with the question + retrieved chunks as context.
+# ---------- Public API ----------
 
-    If `chunks` is empty, returns a canned "no context" answer without calling the API.
+
+def generate_answer(question: str, chunks: list[RetrievedChunk]) -> Answer:
+    """Build a grounded answer from retrieved chunks via the active LLM provider.
+
+    If `chunks` is empty, returns the canned NO_CONTEXT_ANSWER without an LLM call.
     """
     if not question or not question.strip():
         raise ValueError("question must be a non-empty string")
 
+    settings = get_settings()
+
     if not chunks:
+        # Pick a sensible "model" label for the no-context path.
+        model_label = {
+            "ollama": settings.ollama_model,
+            "gemini": settings.gemini_model,
+            "anthropic": settings.anthropic_model,
+        }.get(settings.llm_provider, settings.llm_provider)
         return Answer(
             text=NO_CONTEXT_ANSWER,
             citations=[],
-            model=get_settings().anthropic_model,
+            model=model_label,
             input_tokens=0,
             output_tokens=0,
         )
 
-    settings = get_settings()
-    client = _get_client()
+    provider = _get_provider()
     user_message = _build_user_message(question, chunks)
+    result = provider.complete(SYSTEM_PROMPT, user_message)
 
-    # Cache the system prompt so repeat calls within ~5 min share it.
-    # (When multi-turn conversation lands in Week 2, the per-document context
-    # block will also become a cache target.)
-    response = client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=_MAX_OUTPUT_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    text = "".join(block.text for block in response.content if block.type == "text").strip()
     logger.info(
-        "Generated answer: model=%s in=%d out=%d",
-        response.model,
-        response.usage.input_tokens,
-        response.usage.output_tokens,
+        "Generated answer: provider=%s model=%s in=%d out=%d",
+        settings.llm_provider,
+        result.model,
+        result.input_tokens,
+        result.output_tokens,
     )
 
     return Answer(
-        text=text,
+        text=result.text,
         citations=_chunks_to_citations(chunks),
-        model=response.model,
-        input_tokens=response.usage.input_tokens,
-        output_tokens=response.usage.output_tokens,
+        model=result.model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
     )
