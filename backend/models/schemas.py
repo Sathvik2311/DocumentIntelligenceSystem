@@ -43,6 +43,10 @@ class QueryRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=50)
     doc_id: str | None = Field(default=None, description="Restrict to a single document.")
     filename: str | None = Field(default=None, description="Restrict to a single filename.")
+    retrieval_only: bool = Field(
+        default=False,
+        description="If true, skip the LLM and return only the retrieved chunks.",
+    )
 
 
 class CitationModel(BaseModel):
@@ -51,6 +55,10 @@ class CitationModel(BaseModel):
     page_number: int = Field(..., ge=0)
     chunk_index: int = Field(..., ge=0)
     score: float
+    text: str | None = Field(
+        default=None,
+        description="Chunk text. Populated on retrieval_only or when explicitly requested.",
+    )
 
 
 class QueryResponse(BaseModel):

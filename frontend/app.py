@@ -78,9 +78,16 @@ def api_delete(doc_id: str) -> bool:
 
 
 def api_query(
-    question: str, doc_id: str | None, top_k: int
+    question: str,
+    doc_id: str | None,
+    top_k: int,
+    retrieval_only: bool = False,
 ) -> dict[str, Any] | None:
-    payload: dict[str, Any] = {"question": question, "top_k": top_k}
+    payload: dict[str, Any] = {
+        "question": question,
+        "top_k": top_k,
+        "retrieval_only": retrieval_only,
+    }
     if doc_id:
         payload["doc_id"] = doc_id
     with _client() as c:
@@ -89,6 +96,43 @@ def api_query(
         st.error(f"Query failed — {_format_error(r)}")
         return None
     return r.json()
+
+
+CONFIDENCE_THRESHOLD = 0.30  # cosine sim below this is flagged as low confidence
+TEXT_PREVIEW_CHARS = 600
+
+
+def _render_citations(
+    citations: list[dict[str, Any]],
+    show_text: bool,
+) -> None:
+    """Render a citations expander with optional chunk-text previews."""
+    if not citations:
+        return
+    label = f"📎 {len(citations)} chunk(s)" if show_text else f"📎 {len(citations)} citation(s)"
+    with st.expander(label):
+        for c in citations:
+            st.markdown(
+                f"**[{c['rank']}]** `{c['filename']}` — page {c['page_number']}, "
+                f"chunk {c['chunk_index']} · score `{c['score']:.4f}`"
+            )
+            if show_text and c.get("text"):
+                preview = c["text"]
+                if len(preview) > TEXT_PREVIEW_CHARS:
+                    preview = preview[:TEXT_PREVIEW_CHARS] + "…"
+                st.markdown(f"> {preview}")
+
+
+def _maybe_warn_low_confidence(citations: list[dict[str, Any]]) -> None:
+    """Show a yellow warning when the top similarity score looks weak."""
+    if not citations:
+        return
+    top = max(c["score"] for c in citations)
+    if top < CONFIDENCE_THRESHOLD:
+        st.warning(
+            f"⚠️ Low retrieval confidence (top score `{top:.3f}` < `{CONFIDENCE_THRESHOLD}`). "
+            "The corpus may not cover this question — treat the answer with skepticism."
+        )
 
 
 def api_health_ok() -> bool:
@@ -197,6 +241,16 @@ with st.sidebar:
     # --- Query options ---
     st.subheader("Settings")
     top_k = st.slider("Top-K chunks to retrieve", min_value=1, max_value=10, value=SETTINGS.top_k)
+    retrieval_only = st.checkbox(
+        "Retrieval only (skip LLM)",
+        value=False,
+        help="Return the matching chunks without calling the language model. Free and instant.",
+    )
+    show_chunks = st.checkbox(
+        "Show chunk text in citations",
+        value=False,
+        help="Render the actual passage text under each citation instead of just metadata.",
+    )
 
     if st.button("Clear chat for this scope"):
         key = st.session_state.selected_doc_id or "__all__"
@@ -224,56 +278,59 @@ st.markdown(f"### Ask a question — _{scope_label}_")
 
 history: list[dict] = st.session_state.messages.setdefault(scope_key, [])
 
-# Replay history
+# Replay history. Whether to render chunk text follows the *current* sidebar
+# toggle so users can flip it on retroactively without re-querying.
 for msg in history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if msg.get("citations"):
-            with st.expander(f"📎 {len(msg['citations'])} citation(s)"):
-                for c in msg["citations"]:
-                    st.markdown(
-                        f"**[{c['rank']}]** `{c['filename']}` — page {c['page_number']}, "
-                        f"chunk {c['chunk_index']} · score `{c['score']:.4f}`"
-                    )
+        cits = msg.get("citations") or []
+        if cits and msg["role"] == "assistant":
+            _maybe_warn_low_confidence(cits)
+            _render_citations(cits, show_text=show_chunks or msg.get("retrieval_only", False))
         if msg.get("usage"):
             u = msg["usage"]
             st.caption(f"_{u['model']} · in {u['input_tokens']} / out {u['output_tokens']}_")
 
 # New question
-question = st.chat_input("Ask anything about the selected document…", disabled=not docs)
+placeholder = "Retrieve chunks for…" if retrieval_only else "Ask anything about the selected document…"
+question = st.chat_input(placeholder, disabled=not docs)
 if question:
     history.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            result = api_query(question, doc_id=scope_id, top_k=top_k)
+        spinner_text = "Retrieving…" if retrieval_only else "Thinking…"
+        with st.spinner(spinner_text):
+            result = api_query(
+                question,
+                doc_id=scope_id,
+                top_k=top_k,
+                retrieval_only=retrieval_only,
+            )
 
         if result is None:
-            # api_query already surfaced the error
+            # api_query already surfaced the error in red
             history.append({"role": "assistant", "content": "_(error — see above)_"})
         else:
             st.markdown(result["answer"])
             citations = result.get("citations", [])
-            if citations:
-                with st.expander(f"📎 {len(citations)} citation(s)"):
-                    for c in citations:
-                        st.markdown(
-                            f"**[{c['rank']}]** `{c['filename']}` — page {c['page_number']}, "
-                            f"chunk {c['chunk_index']} · score `{c['score']:.4f}`"
-                        )
+            _maybe_warn_low_confidence(citations)
+            _render_citations(citations, show_text=show_chunks or retrieval_only)
             usage = {
                 "model": result["model"],
                 "input_tokens": result["input_tokens"],
                 "output_tokens": result["output_tokens"],
             }
-            st.caption(f"_{usage['model']} · in {usage['input_tokens']} / out {usage['output_tokens']}_")
+            st.caption(
+                f"_{usage['model']} · in {usage['input_tokens']} / out {usage['output_tokens']}_"
+            )
             history.append(
                 {
                     "role": "assistant",
                     "content": result["answer"],
                     "citations": citations,
                     "usage": usage,
+                    "retrieval_only": retrieval_only,
                 }
             )
