@@ -1,0 +1,10 @@
+{"question": "What company is making this offer?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["TAITConsulting", "TAIT"], "tags": ["factual"]}
+{"question": "What is the role being offered?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["Software Developer", "Developer"], "tags": ["factual"]}
+{"question": "What is the annual base compensation?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["40,000", "40000"], "tags": ["factual", "numeric"]}
+{"question": "Who signed the offer letter on behalf of the company?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["Paila", "President"], "tags": ["factual"]}
+{"question": "What is the candidate's phone number?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["469-768-9260", "469"], "tags": ["factual", "numeric"]}
+{"question": "Summarize this document in one sentence.", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["offer", "employment", "position"], "tags": ["semantic"]}
+{"question": "TAITConsultingGroup", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["TAITConsulting"], "tags": ["keyword"]}
+{"question": "What's mentioned about Sathvik Chaganur?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["SATHVIK", "Sathvik"], "tags": ["factual"]}
+{"question": "Where is the company based?", "filename": "Tait Offer letter - Sathvik.pdf", "must_contain_any": ["TAITConsulting"], "tags": ["semantic"], "expected_negative": true}
+{"question": "What is the meaning of life?", "filename": null, "must_contain_any": [], "tags": ["out-of-corpus"], "expected_negative": true}
