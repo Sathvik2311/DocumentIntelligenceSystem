@@ -77,19 +77,35 @@ def api_delete(doc_id: str) -> bool:
     return True
 
 
+MAX_HISTORY_TURNS = 6  # last 6 turns (3 user + 3 assistant) replayed to the LLM
+
+
 def api_query(
     question: str,
-    doc_id: str | None,
+    doc_ids: list[str] | None,
     top_k: int,
     retrieval_only: bool = False,
+    history: list[dict[str, Any]] | None = None,
+    use_hybrid: bool | None = None,
+    use_reranker: bool | None = None,
 ) -> dict[str, Any] | None:
     payload: dict[str, Any] = {
         "question": question,
         "top_k": top_k,
         "retrieval_only": retrieval_only,
     }
-    if doc_id:
-        payload["doc_id"] = doc_id
+    if doc_ids:
+        payload["doc_ids"] = list(doc_ids)
+    if use_hybrid is not None:
+        payload["use_hybrid"] = use_hybrid
+    if use_reranker is not None:
+        payload["use_reranker"] = use_reranker
+    if history:
+        payload["history"] = [
+            {"role": h["role"], "content": h["content"]}
+            for h in history[-MAX_HISTORY_TURNS:]
+            if h.get("role") in ("user", "assistant") and h.get("content")
+        ]
     with _client() as c:
         r = c.post("/api/query", json=payload)
     if r.status_code != 200:
@@ -154,11 +170,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Per-conversation history keyed by selected doc_id (or "__all__").
+# Per-conversation history keyed by the sorted, joined doc_id list (or "__all__").
 if "messages" not in st.session_state:
     st.session_state.messages = {}  # type: dict[str, list[dict]]
-if "selected_doc_id" not in st.session_state:
-    st.session_state.selected_doc_id = None  # None means "all documents"
+if "selected_doc_ids" not in st.session_state:
+    st.session_state.selected_doc_ids = []  # type: list[str]   # [] means "all documents"
+
+
+def _scope_key(ids: list[str]) -> str:
+    """Stable bucket key for chat history. Empty selection = '__all__'."""
+    return ",".join(sorted(ids)) if ids else "__all__"
+
+
+def _scope_label(ids: list[str], docs: list[dict[str, Any]]) -> str:
+    """Human-readable scope label for the chat header."""
+    if not ids:
+        return "all documents"
+    name_by_id = {d["doc_id"]: d["filename"] for d in docs}
+    names = [name_by_id.get(i, i) for i in ids]
+    if len(names) == 1:
+        return names[0]
+    if len(names) <= 3:
+        return ", ".join(names)
+    return f"{', '.join(names[:2])}, +{len(names) - 2} more"
 
 
 # ---------- Sidebar ----------
@@ -203,25 +237,42 @@ with st.sidebar:
     if not docs:
         st.info("No documents yet. Upload one above.")
     else:
-        labels = ["All documents"] + [
-            f"{d['filename']}  ·  {d['num_chunks']} chunks" for d in docs
-        ]
-        ids = [None] + [d["doc_id"] for d in docs]
+        valid_ids = {d["doc_id"] for d in docs}
+        # Drop any stale ids from a previous selection (e.g. after a delete).
+        prior = {i for i in st.session_state.selected_doc_ids if i in valid_ids}
 
-        # Preserve current selection across reruns when possible.
-        try:
-            current_idx = ids.index(st.session_state.selected_doc_id)
-        except ValueError:
-            current_idx = 0
+        st.write("Scope query to (leave all unchecked for all documents):")
 
-        choice = st.radio(
-            "Scope query to:",
-            options=range(len(labels)),
-            format_func=lambda i: labels[i],
-            index=current_idx,
-            label_visibility="collapsed",
-        )
-        st.session_state.selected_doc_id = ids[choice]
+        # Quick "select all" / "clear" buttons for convenience.
+        ba, bb = st.columns(2)
+        if ba.button("Select all", use_container_width=True):
+            for d in docs:
+                st.session_state[f"docsel-{d['doc_id']}"] = True
+            st.rerun()
+        if bb.button("Clear", use_container_width=True):
+            for d in docs:
+                st.session_state[f"docsel-{d['doc_id']}"] = False
+            st.rerun()
+
+        # One checkbox per document. Initial state comes from prior selection;
+        # subsequent renders read st.session_state[<key>] (set by the widget).
+        selected: list[str] = []
+        for d in docs:
+            key = f"docsel-{d['doc_id']}"
+            default = key not in st.session_state and d["doc_id"] in prior
+            checked = st.checkbox(
+                f"{d['filename']}  ·  {d['num_chunks']} chunks",
+                value=default,
+                key=key,
+            )
+            if checked:
+                selected.append(d["doc_id"])
+        st.session_state.selected_doc_ids = selected
+
+        if selected:
+            st.caption(f"Searching **{len(selected)}** of {len(docs)} document(s).")
+        else:
+            st.caption(f"Searching **all {len(docs)}** document(s).")
 
         # Per-doc delete buttons
         with st.expander("Manage"):
@@ -230,10 +281,14 @@ with st.sidebar:
                 col1.write(f"**{d['filename']}**")
                 if col2.button("🗑", key=f"del-{d['doc_id']}", help="Delete this document"):
                     if api_delete(d["doc_id"]):
-                        # Drop chat history for that doc, reset selection if needed
+                        # Drop chat history for that doc, prune from selection,
+                        # and clear its orphan checkbox state.
                         st.session_state.messages.pop(d["doc_id"], None)
-                        if st.session_state.selected_doc_id == d["doc_id"]:
-                            st.session_state.selected_doc_id = None
+                        st.session_state.selected_doc_ids = [
+                            i for i in st.session_state.selected_doc_ids
+                            if i != d["doc_id"]
+                        ]
+                        st.session_state.pop(f"docsel-{d['doc_id']}", None)
                         st.rerun()
 
     st.divider()
@@ -251,10 +306,27 @@ with st.sidebar:
         value=False,
         help="Render the actual passage text under each citation instead of just metadata.",
     )
+    use_hybrid = st.checkbox(
+        "Hybrid search (BM25 + cosine)",
+        value=SETTINGS.enable_hybrid_search,
+        help="Fuse keyword (BM25) and semantic (cosine) rankings. Better recall on rare names/numbers.",
+    )
+    use_reranker = st.checkbox(
+        "Cross-encoder rerank",
+        value=SETTINGS.enable_reranker,
+        help="Rerank candidates with a cross-encoder. Adds 50-200 ms per query but big quality bump.",
+    )
+
+    pipeline_bits = ["dense"]
+    if use_hybrid:
+        pipeline_bits.append("BM25")
+        pipeline_bits.append("RRF")
+    if use_reranker:
+        pipeline_bits.append("rerank")
+    st.caption("Retrieval: " + " → ".join(pipeline_bits))
 
     if st.button("Clear chat for this scope"):
-        key = st.session_state.selected_doc_id or "__all__"
-        st.session_state.messages.pop(key, None)
+        st.session_state.messages.pop(_scope_key(st.session_state.selected_doc_ids), None)
         st.rerun()
 
     st.caption(
@@ -267,12 +339,9 @@ with st.sidebar:
 
 
 # Resolve the active scope label and chat history bucket
-scope_id = st.session_state.selected_doc_id
-scope_key = scope_id or "__all__"
-scope_label = "all documents"
-if scope_id:
-    match = next((d for d in docs if d["doc_id"] == scope_id), None)
-    scope_label = match["filename"] if match else scope_id
+scope_ids: list[str] = list(st.session_state.selected_doc_ids)
+scope_key = _scope_key(scope_ids)
+scope_label = _scope_label(scope_ids, docs)
 
 st.markdown(f"### Ask a question — _{scope_label}_")
 
@@ -292,8 +361,37 @@ for msg in history:
             st.caption(f"_{u['model']} · in {u['input_tokens']} / out {u['output_tokens']}_")
 
 # New question
-placeholder = "Retrieve chunks for…" if retrieval_only else "Ask anything about the selected document…"
-question = st.chat_input(placeholder, disabled=not docs)
+placeholder = (
+    "Retrieve chunks for…" if retrieval_only else "Ask, or attach a document via the 📎 button…"
+)
+# accept_file=True adds a paperclip icon for inline upload. The returned value is a
+# dict-like ChatInputValue with .text (str) and ["files"] (list of UploadedFile).
+chat_value = st.chat_input(
+    placeholder,
+    accept_file="multiple",
+    file_type=["pdf", "docx", "txt"],
+)
+
+# 1) Handle any inline-uploaded files first, regardless of whether text was sent.
+if chat_value and chat_value.get("files"):
+    new_uploads: list[str] = []
+    for f in chat_value["files"]:
+        with st.spinner(f"Ingesting {f.name}…"):
+            res = api_upload(f.name, f.getvalue(), f.type or "")
+        if res:
+            new_uploads.append(
+                f"**{res['filename']}** ({res['num_pages']} pages → {res['num_chunks']} chunks)"
+            )
+    if new_uploads:
+        st.success("Ingested: " + ", ".join(new_uploads))
+        # Refresh the doc list so the new docs appear in the sidebar checkboxes.
+        # Streamlit reruns automatically on next interaction; force one now if no
+        # text follows, otherwise let the query path handle the rerun naturally.
+        if not (chat_value.get("text") or "").strip():
+            st.rerun()
+
+# 2) If text was also submitted (or only text), run the query.
+question = (chat_value.get("text") or "").strip() if chat_value else ""
 if question:
     history.append({"role": "user", "content": question})
     with st.chat_message("user"):
@@ -301,12 +399,17 @@ if question:
 
     with st.chat_message("assistant"):
         spinner_text = "Retrieving…" if retrieval_only else "Thinking…"
+        # Pass everything before the just-appended user turn as conversation history.
+        prior_turns = history[:-1]
         with st.spinner(spinner_text):
             result = api_query(
                 question,
-                doc_id=scope_id,
+                doc_ids=scope_ids or None,
                 top_k=top_k,
                 retrieval_only=retrieval_only,
+                history=prior_turns,
+                use_hybrid=use_hybrid,
+                use_reranker=use_reranker,
             )
 
         if result is None:

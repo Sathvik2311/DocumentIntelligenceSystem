@@ -38,14 +38,44 @@ class DeleteResponse(BaseModel):
 # ---------- Query ----------
 
 
+class ConversationTurn(BaseModel):
+    """One turn of prior conversation, replayed into the LLM for follow-ups."""
+
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural-language question.")
     top_k: int | None = Field(default=None, ge=1, le=50)
-    doc_id: str | None = Field(default=None, description="Restrict to a single document.")
+    doc_id: str | None = Field(
+        default=None,
+        description="Restrict to a single document (legacy shortcut; prefer doc_ids).",
+    )
+    doc_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Restrict to a specific set of documents. Empty/null means search all. "
+            "Takes precedence over doc_id when both are set."
+        ),
+    )
     filename: str | None = Field(default=None, description="Restrict to a single filename.")
     retrieval_only: bool = Field(
         default=False,
         description="If true, skip the LLM and return only the retrieved chunks.",
+    )
+    history: list[ConversationTurn] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Prior turns of the same conversation; replayed before the new question.",
+    )
+    use_hybrid: bool | None = Field(
+        default=None,
+        description="Override ENABLE_HYBRID_SEARCH. None = use server default.",
+    )
+    use_reranker: bool | None = Field(
+        default=None,
+        description="Override ENABLE_RERANKER. None = use server default.",
     )
 
 

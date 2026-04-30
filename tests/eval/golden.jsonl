@@ -1,0 +1,10 @@
+{"question": "What is the title of this paper?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["Attention Is All You Need", "Attention", "Transformer"], "tags": ["factual"]}
+{"question": "Who are the authors of this paper?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["Vaswani", "Shazeer", "Parmar"], "tags": ["factual"]}
+{"question": "What BLEU score did the model achieve on WMT 2014 English-to-German translation?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["28.4", "BLEU"], "tags": ["factual", "numeric"]}
+{"question": "What architecture does the paper propose to replace recurrence and convolution?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["Transformer", "attention"], "tags": ["factual", "semantic"]}
+{"question": "What are the two sub-layers in each encoder layer?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["multi-head", "feed-forward"], "tags": ["factual"]}
+{"question": "What training dataset was used for the translation tasks?", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["WMT", "2014"], "tags": ["factual"]}
+{"question": "Summarize the key contribution of this paper in one sentence.", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["attention", "Transformer", "recurrence"], "tags": ["semantic"]}
+{"question": "multi-head attention", "filename": "attention_is_all_you_need.pdf", "must_contain_any": ["attention"], "tags": ["keyword"]}
+{"question": "What is the capital of Australia?", "filename": null, "must_contain_any": [], "tags": ["out-of-corpus"], "expected_negative": true}
+{"question": "What year was the Eiffel Tower built?", "filename": null, "must_contain_any": [], "tags": ["out-of-corpus"], "expected_negative": true}

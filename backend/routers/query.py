@@ -39,7 +39,10 @@ async def query(req: QueryRequest) -> QueryResponse:
             req.question,
             top_k=req.top_k,
             doc_id=req.doc_id,
+            doc_ids=req.doc_ids,
             filename=req.filename,
+            use_hybrid=req.use_hybrid,
+            use_reranker=req.use_reranker,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -55,8 +58,10 @@ async def query(req: QueryRequest) -> QueryResponse:
             output_tokens=0,
         )
 
+    history = [{"role": t.role, "content": t.content} for t in req.history]
+
     try:
-        answer = generate_answer(req.question, chunks)
+        answer = generate_answer(req.question, chunks, history=history)
     except RuntimeError as exc:
         # e.g. provider not configured / unreachable.
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
