@@ -1,8 +1,8 @@
 """Generation service: build a grounded prompt from retrieved chunks and call an LLM.
 
 The active LLM provider is selected by the LLM_PROVIDER env var (ollama | gemini |
-anthropic). Each provider implements a tiny `complete(system, user)` interface and
-is lazily imported so unused providers don't crash on missing creds.
+anthropic). Each provider implements a tiny `complete(system, messages)` interface
+and is lazily imported so unused providers don't crash on missing creds.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 import httpx
 
@@ -27,7 +27,9 @@ SYSTEM_PROMPT = (
     "- If the chunks do not contain enough information to answer, say so explicitly. "
     "Do not invent facts or use outside knowledge.\n"
     "- Quote sparingly; prefer concise synthesis over copy-paste.\n"
-    "- Keep answers under 200 words unless the question genuinely requires more detail."
+    "- Keep answers under 200 words unless the question genuinely requires more detail.\n"
+    "- When prior conversation turns are present, treat them as context for follow-up "
+    "questions but ground every factual claim in the numbered chunks."
 )
 
 NO_CONTEXT_ANSWER = (
@@ -36,6 +38,11 @@ NO_CONTEXT_ANSWER = (
 )
 
 _MAX_OUTPUT_TOKENS = 1024
+
+
+class Message(TypedDict):
+    role: str  # "user" | "assistant"
+    content: str
 
 
 @dataclass(frozen=True)
@@ -74,21 +81,18 @@ class ProviderResponse:
 
 
 class _Provider(Protocol):
-    def complete(self, system: str, user: str) -> ProviderResponse: ...
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse: ...
 
 
 class _OllamaProvider:
     """Local Ollama via the native /api/chat endpoint. No SDK; uses httpx."""
 
-    def complete(self, system: str, user: str) -> ProviderResponse:
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
         s = get_settings()
         url = f"{s.ollama_base_url.rstrip('/')}/api/chat"
         payload = {
             "model": s.ollama_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": "system", "content": system}, *messages],
             "stream": False,
             "options": {"num_predict": _MAX_OUTPUT_TOKENS},
         }
@@ -118,9 +122,9 @@ class _OllamaProvider:
 
 
 class _GeminiProvider:
-    """Google Gemini via google-generativeai SDK."""
+    """Google Gemini via google-generativeai SDK. Multi-turn via ChatSession."""
 
-    def complete(self, system: str, user: str) -> ProviderResponse:
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
         import google.generativeai as genai  # lazy import
 
         s = get_settings()
@@ -129,17 +133,31 @@ class _GeminiProvider:
                 "GEMINI_API_KEY is not set. Add it to .env or switch LLM_PROVIDER."
             )
         genai.configure(api_key=s.gemini_api_key)
-        model = genai.GenerativeModel(model_name=s.gemini_model)
+        model = genai.GenerativeModel(
+            model_name=s.gemini_model,
+            system_instruction=system,
+        )
 
-        response = model.generate_content(
-            [system, user],
+        # Replay all but the last message as chat history; send the last as the new turn.
+        # Gemini uses "model" instead of "assistant".
+        if not messages:
+            raise RuntimeError("Gemini provider received empty messages list.")
+        history = [
+            {
+                "role": "user" if m["role"] == "user" else "model",
+                "parts": [m["content"]],
+            }
+            for m in messages[:-1]
+        ]
+        chat = model.start_chat(history=history)
+        response = chat.send_message(
+            messages[-1]["content"],
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=_MAX_OUTPUT_TOKENS
             ),
         )
         text = response.text.strip() if response.text else ""
 
-        # Gemini SDK returns usage_metadata when available.
         input_tokens = output_tokens = 0
         usage = getattr(response, "usage_metadata", None)
         if usage:
@@ -155,9 +173,9 @@ class _GeminiProvider:
 
 
 class _AnthropicProvider:
-    """Anthropic Claude via the anthropic SDK."""
+    """Anthropic Claude via the anthropic SDK. Native multi-turn support."""
 
-    def complete(self, system: str, user: str) -> ProviderResponse:
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
         from anthropic import Anthropic  # lazy import
 
         s = get_settings()
@@ -171,7 +189,7 @@ class _AnthropicProvider:
             model=s.anthropic_model,
             max_tokens=_MAX_OUTPUT_TOKENS,
             system=system,
-            messages=[{"role": "user", "content": user}],
+            messages=[{"role": m["role"], "content": m["content"]} for m in messages],
         )
         text = "".join(b.text for b in response.content if b.type == "text").strip()
         return ProviderResponse(
@@ -230,13 +248,46 @@ def _chunks_to_citations(chunks: list[RetrievedChunk]) -> list[Citation]:
     ]
 
 
+def _build_messages(
+    question: str,
+    chunks: list[RetrievedChunk],
+    history: list[Message] | None,
+) -> list[Message]:
+    """Compose the full message list to send to the provider.
+
+    Prior turns are replayed as plain text (their original retrieved chunks are not
+    re-attached). The newest question carries the freshly retrieved chunks.
+    """
+    msgs: list[Message] = []
+    if history:
+        for turn in history:
+            if turn["role"] not in ("user", "assistant") or not turn["content"]:
+                continue
+            msgs.append({"role": turn["role"], "content": turn["content"]})
+    msgs.append({"role": "user", "content": _build_user_message(question, chunks)})
+    return msgs
+
+
 # ---------- Public API ----------
 
 
-def generate_answer(question: str, chunks: list[RetrievedChunk]) -> Answer:
+def generate_answer(
+    question: str,
+    chunks: list[RetrievedChunk],
+    history: list[Message] | None = None,
+) -> Answer:
     """Build a grounded answer from retrieved chunks via the active LLM provider.
 
-    If `chunks` is empty, returns the canned NO_CONTEXT_ANSWER without an LLM call.
+    Args:
+        question: The new natural-language question.
+        chunks: Retrieved context chunks for `question`.
+        history: Optional prior conversation turns (alternating user/assistant).
+            Replayed before the new question; capped/sanitised by the caller.
+
+    Returns:
+        An Answer with the LLM's response, source citations built from `chunks`,
+        and provider usage metadata. If `chunks` is empty, returns NO_CONTEXT_ANSWER
+        without calling the provider.
     """
     if not question or not question.strip():
         raise ValueError("question must be a non-empty string")
@@ -244,7 +295,6 @@ def generate_answer(question: str, chunks: list[RetrievedChunk]) -> Answer:
     settings = get_settings()
 
     if not chunks:
-        # Pick a sensible "model" label for the no-context path.
         model_label = {
             "ollama": settings.ollama_model,
             "gemini": settings.gemini_model,
@@ -259,13 +309,14 @@ def generate_answer(question: str, chunks: list[RetrievedChunk]) -> Answer:
         )
 
     provider = _get_provider()
-    user_message = _build_user_message(question, chunks)
-    result = provider.complete(SYSTEM_PROMPT, user_message)
+    messages = _build_messages(question, chunks, history)
+    result = provider.complete(SYSTEM_PROMPT, messages)
 
     logger.info(
-        "Generated answer: provider=%s model=%s in=%d out=%d",
+        "Generated answer: provider=%s model=%s history_turns=%d in=%d out=%d",
         settings.llm_provider,
         result.model,
+        len(history or []),
         result.input_tokens,
         result.output_tokens,
     )

@@ -31,6 +31,7 @@ htmlcov/
 # Project data
 chroma_db/
 !chroma_db/.gitkeep
+tests/eval/results-*.json
 uploads/
 *.log
 
