@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=1000)
     chunk_overlap: int = Field(default=200)
     top_k: int = Field(default=5)
+    retrieval_candidates: int = Field(
+        default=20,
+        description="Top-N candidates pulled by each retrieval stage before fusion/rerank.",
+    )
+
+    # --- Quality stages (defaults; per-request overrides via QueryRequest) ---
+    enable_hybrid_search: bool = Field(
+        default=True,
+        description="Fuse BM25 and cosine results via Reciprocal Rank Fusion.",
+    )
+    enable_reranker: bool = Field(
+        default=True,
+        description="Rerank fused candidates with a cross-encoder before sending to the LLM.",
+    )
+    reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
+
     log_level: str = Field(default="INFO")
 
 

@@ -208,6 +208,9 @@ def store_chunks(chunks: list[DocumentChunk]) -> int:
 
     get_collection().upsert(ids = ids, embeddings = embeddings, documents = documents, metadatas = metadatas, )
     logger.info("Stored %d chunks for %s", len(chunks), chunks[0].filename)
+    # Lazy import — bm25 imports back into ingestion for the collection accessor.
+    from backend.services import bm25 as _bm25
+    _bm25.mark_dirty()
     return len(chunks)
 
 
@@ -271,4 +274,6 @@ def delete_document(doc_id: str) -> int:
         return 0
     collection.delete(where={"doc_id": doc_id})
     logger.info("Deleted %d chunks for doc_id=%s", n, doc_id)
+    from backend.services import bm25 as _bm25
+    _bm25.mark_dirty()
     return n
