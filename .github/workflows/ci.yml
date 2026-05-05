@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches-ignore: []
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Lint + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Skip the 22 MB cross-encoder download; tests opt-in via fake CrossEncoder.
+      ENABLE_RERANKER: "false"
+      # Embedder cache lives here so it can be restored between runs.
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: ${{ github.workspace }}/.cache/sentence-transformers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Hugging Face / sentence-transformers models
+        # Embedder weights (~80 MB) are downloaded the first time tests run; cache
+        # them so subsequent runs start in a few seconds.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.HF_HOME }}
+            ${{ env.SENTENCE_TRANSFORMERS_HOME }}
+          key: hf-${{ runner.os }}-MiniLM-L6-v2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest tests/ -q

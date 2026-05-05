@@ -16,7 +16,6 @@ from backend.services.ingestion import (
     parse_document,
 )
 
-
 # ---------- parse_document ----------
 
 

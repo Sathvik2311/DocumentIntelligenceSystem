@@ -54,7 +54,7 @@ def rerank(
             chunk_index=c.chunk_index,
             score=float(s),
         )
-        for c, s in zip(candidates, scores)
+        for c, s in zip(candidates, scores, strict=False)
     ]
     scored.sort(key=lambda ch: ch.score, reverse=True)
     return scored[:top_k]
