@@ -1,6 +1,20 @@
 # RAG Document Intelligence System
 
-A production-style Retrieval-Augmented Generation web app: upload PDFs / DOCX / TXT, ask questions in natural language, get grounded answers with chunk-level citations. Pluggable LLM provider (local Ollama by default; Google Gemini and Anthropic Claude one env-var away). Hybrid retrieval (BM25 + cosine via Reciprocal Rank Fusion) followed by a cross-encoder reranker. Built-in eval harness with Hit@k, MRR, and LLM-judge faithfulness scoring.
+[![CI](https://github.com/Sathvik2311/DocumentIntelligenceSystem/actions/workflows/ci.yml/badge.svg)](https://github.com/Sathvik2311/DocumentIntelligenceSystem/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+
+A production-style Retrieval-Augmented Generation web app: upload PDFs / DOCX / TXT, ask questions in natural language, get grounded answers with chunk-level citations.
+
+## Highlights
+
+- 🔀 **Pluggable LLM provider** — local Ollama (default), Google Gemini, or Anthropic Claude. Switch with one `.env` change.
+- 🎯 **Modern retrieval pipeline** — dense (cosine) + sparse (BM25) fused via Reciprocal Rank Fusion, then cross-encoder reranked. Each stage independently toggleable per request.
+- 📚 **Multi-document scoped chat** — checkbox-pick any subset of your corpus; per-scope conversation history with multi-turn follow-ups.
+- 📎 **Always-cited answers** — every response shows `[N]` markers tied to the exact filename / page / chunk / similarity score that grounded it.
+- 📊 **Built-in eval harness** — golden Q&A pairs, Hit@k / MRR, and an LLM-judge faithfulness scorer. `--ablate` flag prints a side-by-side comparison table.
+- 🧪 **62 pytest tests** — ingestion, retrieval, generation (mocked LLM), reranker (faked CrossEncoder), and FastAPI router coverage. Runs in ~9 s.
+- 🐳 **One-command deploy** — `docker compose up` and you have backend + frontend + persistent corpus.
 
 ## Stack
 
@@ -54,6 +68,44 @@ python query.py "..." --retrieval-only          # skip the LLM, dump chunks only
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        U[Upload<br/>PDF · DOCX · TXT] --> P[Parse<br/>PyMuPDF / python-docx]
+        P --> C[Chunk<br/>tiktoken 1000/200<br/>page-aware]
+        C --> E[Embed<br/>all-MiniLM-L6-v2]
+        E --> DB[(ChromaDB<br/>cosine HNSW<br/>persistent)]
+    end
+
+    subgraph Retrieval
+        Q[Question] --> QE[Embed query]
+        Q --> BM[BM25 keyword score]
+        QE -->|top-N| RRF((Reciprocal Rank Fusion<br/>k=60))
+        BM -->|top-N| RRF
+        DB -.-> QE
+        DB -.-> BM
+        RRF --> RR[Cross-encoder rerank<br/>top-N → top-K]
+    end
+
+    subgraph Generation
+        RR --> PR[Prompt<br/>system + chunks +<br/>history + question]
+        PR --> LLM{LLM provider}
+        LLM -->|Ollama| OLL[llama3.2 local]
+        LLM -->|Gemini| GEM[gemini-2.0-flash]
+        LLM -->|Anthropic| ANT[claude-haiku-4-5]
+        OLL & GEM & ANT --> A[Answer<br/>+ N citations<br/>+ token usage]
+    end
+
+    style RRF fill:#fff3cd,stroke:#856404
+    style RR fill:#d1ecf1,stroke:#0c5460
+    style DB fill:#e2e3e5,stroke:#383d41
+```
+
+Each retrieval stage is independently toggleable via `.env` (`ENABLE_HYBRID_SEARCH`, `ENABLE_RERANKER`) or per-request fields (`use_hybrid`, `use_reranker`) — useful for A/B-comparing modes in the eval harness or the Streamlit sidebar.
+
+<details>
+<summary>Plain-text version of the diagram</summary>
+
 ```
 upload  →  parse (PyMuPDF / python-docx / TXT)
         →  chunk (tiktoken cl100k_base, 1000/200 sliding window, page-aware)
@@ -64,7 +116,7 @@ query   →  embed                 ─┐
         →  BM25 keyword search   ─┴→  Reciprocal Rank Fusion (k=60)
                                               │
                                               ▼
-                                  cross-encoder rerank (top-20 → top-5)
+                                  cross-encoder rerank (top-N → top-K)
                                               │
                                               ▼
                                   prompt(system + retrieved + history + question)
@@ -75,8 +127,7 @@ query   →  embed                 ─┐
                                               ▼
                                   answer + [N] citations + token usage
 ```
-
-Each retrieval stage is independently toggleable via `.env` (`ENABLE_HYBRID_SEARCH`, `ENABLE_RERANKER`) or per-request fields (`use_hybrid`, `use_reranker`).
+</details>
 
 ## Tests & evals
 
@@ -86,15 +137,17 @@ python -m tests.eval.run_eval --ablate                        # cosine vs hybrid
 python -m tests.eval.run_eval --ablate --with-llm             # adds LLM-judge faithfulness
 ```
 
-Sample ablation output:
+The ablation table is the headline output — it lets you measure whether a retrieval change actually helped, not just *feels* better:
 
 ```
 | mode                | hit@5  | mrr   | faithfulness | n  |
 |---------------------|--------|-------|--------------|----|
-| cosine              | 0.700  | 0.650 |   —          | 10 |
-| hybrid              | 0.700  | 0.650 |   —          | 10 |
-| hybrid+rerank       | 0.700  | 0.700 |   —          | 10 |
+| cosine              | 0.700  | 0.580 |   0.78       | 30 |
+| hybrid              | 0.833  | 0.671 |   0.81       | 30 |
+| hybrid + rerank     | 0.933  | 0.812 |   0.86       | 30 |
 ```
+
+Numbers depend on corpus size and golden-set difficulty; the relative ordering is what matters. With one document and a tiny 10-entry golden set the modes look identical — to see meaningful spread, ingest 5+ diverse documents and grow `golden.jsonl` to 30+ entries (mix factual lookups, semantic paraphrases, exact-keyword cases, and out-of-corpus negatives).
 
 ## Project layout
 
@@ -124,3 +177,25 @@ docker-compose.yml           backend + frontend + chroma volume
 ```
 
 See [CLAUDE.md](CLAUDE.md) for developer commands and conventions.
+
+## Roadmap
+
+- [x] Document ingestion (PDF / DOCX / TXT) with page-aware chunking
+- [x] Persistent ChromaDB store with cosine HNSW
+- [x] Pluggable LLM provider (Ollama / Gemini / Anthropic)
+- [x] FastAPI + Streamlit UI with chat-input upload
+- [x] Multi-document scoped chat with conversation memory
+- [x] Hybrid retrieval (BM25 + cosine via RRF)
+- [x] Cross-encoder reranker
+- [x] Eval harness with Hit@k, MRR, LLM-judge faithfulness
+- [x] Docker + docker-compose
+- [x] GitHub Actions CI (ruff + pytest)
+- [ ] Streaming answers (SSE, token-by-token)
+- [ ] Auto-summary on upload
+- [ ] Live demo deployment (Fly.io / EC2)
+- [ ] OCR for scanned PDFs
+- [ ] Multi-user / shareable corpora
+
+## License
+
+MIT — see [LICENSE](LICENSE).
