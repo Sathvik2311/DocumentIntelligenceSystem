@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pymupdf
 import pytest
@@ -29,8 +29,14 @@ def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     from backend import config as _config
     from backend.services import (
         bm25 as _bm25,
+    )
+    from backend.services import (
         generation as _gen,
+    )
+    from backend.services import (
         ingestion as _ing,
+    )
+    from backend.services import (
         reranker as _rr,
     )
 

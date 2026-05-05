@@ -1,1 +1,61 @@
-# TODO: Week 3 Day 1 — compose backend + ChromaDB volume.
+ # RAG Document Intelligence — full stack
+# Usage:
+#   docker compose up --build           # foreground, both services
+#   docker compose up -d --build        # detached
+#   docker compose down                 # stop (data preserved in named volumes)
+#   docker compose down -v              # stop + wipe corpus + caches
+#
+# The Ollama runtime is expected to run on the *host* (`ollama serve`); the
+# containers reach it via host.docker.internal. To target Gemini or Anthropic
+# instead, set LLM_PROVIDER + the relevant API key in your local .env.
+
+services:
+  backend:
+    build: .
+    image: rag-doc-intel:latest
+    container_name: rag-backend
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    environment:
+      # Override host-only defaults for the containerised network.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      CHROMA_PERSIST_DIR: /app/chroma_db
+    volumes:
+      - chroma_data:/app/chroma_db
+      - hf_cache:/cache/huggingface
+      - st_cache:/cache/sentence-transformers
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      # Lets containers resolve `host.docker.internal` on Linux too.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build: .
+    image: rag-doc-intel:latest
+    container_name: rag-frontend
+    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0 --browser.gatherUsageStats false
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network the API is reachable at the service hostname.
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  hf_cache:
+  st_cache:

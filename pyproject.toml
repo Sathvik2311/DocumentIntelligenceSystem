@@ -1,0 +1,41 @@
+# Project-wide tool configuration. Build/install metadata stays in requirements.txt.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+exclude = [
+    ".venv",
+    "chroma_db",
+    "tests/eval/results-*.json",
+]
+
+[tool.ruff.lint]
+# Start strict-ish but pragmatic. Expand later as the project matures.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort (import order)
+    "B",   # flake8-bugbear (likely bugs)
+    "UP",  # pyupgrade (modern Python idioms)
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "E501",  # line length is enforced by formatter / line-length config, not the linter
+    "B008",  # FastAPI uses Depends() / File() defaults legitimately
+    "UP007", # `X | Y` over `Optional[X]` — keep stable across Pydantic v2 quirks
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]                  # `assert False` is fine in tests
+"frontend/app.py" = ["E402"]          # sys.path shim runs before imports on purpose
+"tests/eval/run_eval.py" = ["E402"]   # same — sys.path shim before imports
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
