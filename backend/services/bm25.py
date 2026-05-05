@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache state. The lock guards rebuilds; reads are best-effort.
 _LOCK = threading.Lock()
-_INDEX: "_BM25Snapshot | None" = None
+_INDEX: _BM25Snapshot | None = None
 _DIRTY: bool = True
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -100,7 +100,7 @@ def score_query(query: str, top_n: int) -> list[tuple[str, float]]:
     scores = snap.index.get_scores(tokens)
     # argsort descending on score, drop zero-score hits (BM25 returns 0 for no overlap).
     ranked = sorted(
-        ((cid, float(s)) for cid, s in zip(snap.chunk_ids, scores) if s > 0),
+        ((cid, float(s)) for cid, s in zip(snap.chunk_ids, scores, strict=False) if s > 0),
         key=lambda pair: pair[1],
         reverse=True,
     )
