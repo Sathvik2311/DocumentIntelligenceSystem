@@ -1,0 +1,44 @@
+# Version control
+.git/
+.github/
+
+# Python tooling / caches
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment / secrets — mounted at runtime, never baked into the image
+.env
+.env.local
+.env.*.local
+
+# Project data — persisted via volume, not packaged
+chroma_db/
+
+# Test artefacts
+tests/eval/results-*.json
+
+# Build artefacts
+dist/
+build/
+*.egg-info/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Documentation that isn't needed at runtime
+*.md
+!CLAUDE.md

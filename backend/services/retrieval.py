@@ -199,7 +199,7 @@ def _hydrate_chunks_by_id(ids: list[str]) -> list[RetrievedChunk]:
     fetched_ids = rows.get("ids") or []
     documents = rows.get("documents") or []
     metadatas = rows.get("metadatas") or []
-    for cid, text, meta in zip(fetched_ids, documents, metadatas):
+    for _cid, text, meta in zip(fetched_ids, documents, metadatas, strict=False):
         out.append(
             RetrievedChunk(
                 text=text,
@@ -261,7 +261,7 @@ def _rows_to_chunks(
     distances = (result.get("distances") or [[]])[0]
 
     chunks: list[RetrievedChunk] = []
-    for text, meta, distance in zip(documents, metadatas, distances):
+    for text, meta, distance in zip(documents, metadatas, distances, strict=False):
         chunks.append(
             RetrievedChunk(
                 text=text,
