@@ -190,7 +190,7 @@ See [CLAUDE.md](CLAUDE.md) for developer commands and conventions.
 - [x] Eval harness with Hit@k, MRR, LLM-judge faithfulness
 - [x] Docker + docker-compose
 - [x] GitHub Actions CI (ruff + pytest)
-- [ ] Streaming answers (SSE, token-by-token)
+- [x] Streaming answers (SSE, token-by-token)
 - [ ] Auto-summary on upload
 - [ ] Live demo deployment (Fly.io / EC2)
 - [ ] OCR for scanned PDFs
