@@ -22,6 +22,14 @@ class _FakeProvider:
             output_tokens=2,
         )
 
+    def stream(self, system: str, messages: list[dict]):
+        self.last_messages = messages
+        for tok in ["ok ", "[1]"]:
+            yield generation.StreamEvent(delta=tok)
+        yield generation.StreamEvent(
+            done=True, model="fake", input_tokens=10, output_tokens=2
+        )
+
 
 @pytest.fixture
 def fake_provider(monkeypatch: pytest.MonkeyPatch) -> _FakeProvider:
@@ -221,6 +229,79 @@ def test_query_doc_ids_restricts_to_subset(
     body = r.json()
     assert body["citations"]
     assert all(c["filename"] == "sample.pdf" for c in body["citations"])
+
+
+def _parse_sse(text: str) -> list[tuple[str, dict]]:
+    """Parse an SSE stream into a list of (event, data) tuples."""
+    import json as _json
+    out: list[tuple[str, dict]] = []
+    cur_event: str | None = None
+    for line in text.splitlines():
+        if not line:
+            cur_event = None
+            continue
+        if line.startswith("event: "):
+            cur_event = line[len("event: ") :].strip()
+        elif line.startswith("data: ") and cur_event is not None:
+            out.append((cur_event, _json.loads(line[len("data: ") :])))
+    return out
+
+
+def test_query_stream_emits_citations_tokens_and_done(
+    client: TestClient, fake_provider: _FakeProvider, sample_pdf: Path
+) -> None:
+    _upload(client, sample_pdf)
+    with client.stream(
+        "POST",
+        "/api/query/stream",
+        json={"question": "hello world", "top_k": 2},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        body = "".join(r.iter_text())
+
+    events = _parse_sse(body)
+    names = [e for e, _ in events]
+    assert names[0] == "citations"
+    assert "token" in names
+    assert names[-1] == "done"
+
+    # Concatenated tokens reconstruct the answer.
+    tokens = [d["text"] for e, d in events if e == "token"]
+    assert "".join(tokens) == "ok [1]"
+
+    # Citations are the retrieved chunks.
+    citations = events[0][1]["citations"]
+    assert len(citations) == 2
+    assert all(c.get("text") for c in citations)
+
+    # Done carries usage from the provider.
+    done = [d for e, d in events if e == "done"][0]
+    assert done == {"model": "fake", "input_tokens": 10, "output_tokens": 2}
+
+
+def test_query_stream_retrieval_only_skips_llm(
+    client: TestClient, fake_provider: _FakeProvider, sample_pdf: Path
+) -> None:
+    _upload(client, sample_pdf)
+    with client.stream(
+        "POST",
+        "/api/query/stream",
+        json={"question": "hello world", "top_k": 2, "retrieval_only": True},
+    ) as r:
+        assert r.status_code == 200
+        body = "".join(r.iter_text())
+
+    events = _parse_sse(body)
+    assert [e for e, _ in events] == ["citations", "done"]
+    assert getattr(fake_provider, "last_messages", None) is None
+    done = events[-1][1]
+    assert done == {"model": "(none)", "input_tokens": 0, "output_tokens": 0}
+
+
+def test_query_stream_validation_error_on_empty_question(client: TestClient) -> None:
+    r = client.post("/api/query/stream", json={"question": ""})
+    assert r.status_code == 422
 
 
 def test_query_empty_doc_ids_searches_all(

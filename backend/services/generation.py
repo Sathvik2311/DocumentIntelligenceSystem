@@ -1,13 +1,19 @@
 """Generation service: build a grounded prompt from retrieved chunks and call an LLM.
 
 The active LLM provider is selected by the LLM_PROVIDER env var (ollama | gemini |
-anthropic). Each provider implements a tiny `complete(system, messages)` interface
-and is lazily imported so unused providers don't crash on missing creds.
+anthropic). Each provider implements two tiny methods:
+
+  • complete(system, messages) -> ProviderResponse        (non-streaming)
+  • stream(system, messages)   -> Iterator[StreamEvent]   (token-by-token)
+
+Providers are lazily imported so unused ones don't crash on missing creds.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol, TypedDict
@@ -80,32 +86,52 @@ class ProviderResponse:
     output_tokens: int
 
 
+@dataclass(frozen=True)
+class StreamEvent:
+    """One unit emitted while streaming.
+
+    Either a text delta (`delta` set, `done=False`) or a final terminator
+    (`done=True`) carrying total usage. Providers always end the stream with
+    exactly one `done=True` event.
+    """
+
+    delta: str = ""
+    done: bool = False
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 class _Provider(Protocol):
     def complete(self, system: str, messages: list[Message]) -> ProviderResponse: ...
+    def stream(
+        self, system: str, messages: list[Message]
+    ) -> Iterator[StreamEvent]: ...
 
 
 class _OllamaProvider:
     """Local Ollama via the native /api/chat endpoint. No SDK; uses httpx."""
 
-    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+    def _payload(self, system: str, messages: list[Message], stream: bool) -> dict:
         s = get_settings()
-        url = f"{s.ollama_base_url.rstrip('/')}/api/chat"
-        payload = {
+        return {
             "model": s.ollama_model,
             "messages": [{"role": "system", "content": system}, *messages],
-            "stream": False,
+            "stream": stream,
             "options": {"num_predict": _MAX_OUTPUT_TOKENS},
         }
+
+    def _url(self) -> str:
+        return f"{get_settings().ollama_base_url.rstrip('/')}/api/chat"
+
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+        s = get_settings()
         try:
             with httpx.Client(timeout=120.0) as client:
-                r = client.post(url, json=payload)
+                r = client.post(self._url(), json=self._payload(system, messages, stream=False))
                 r.raise_for_status()
         except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Could not reach Ollama at {s.ollama_base_url}. "
-                f"Is `ollama serve` running and have you pulled `{s.ollama_model}` "
-                f"with `ollama pull {s.ollama_model}`?"
-            ) from exc
+            raise RuntimeError(self._connect_hint()) from exc
         except httpx.HTTPStatusError as exc:
             raise RuntimeError(
                 f"Ollama returned {exc.response.status_code}: {exc.response.text[:200]}"
@@ -120,11 +146,49 @@ class _OllamaProvider:
             output_tokens=int(data.get("eval_count", 0)),
         )
 
+    def stream(self, system: str, messages: list[Message]) -> Iterator[StreamEvent]:
+        s = get_settings()
+        model = s.ollama_model
+        in_tok = out_tok = 0
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                with client.stream(
+                    "POST", self._url(), json=self._payload(system, messages, stream=True)
+                ) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        model = obj.get("model", model)
+                        msg = obj.get("message") or {}
+                        delta = msg.get("content") or ""
+                        if delta:
+                            yield StreamEvent(delta=delta)
+                        if obj.get("done"):
+                            in_tok = int(obj.get("prompt_eval_count", 0) or 0)
+                            out_tok = int(obj.get("eval_count", 0) or 0)
+        except httpx.ConnectError as exc:
+            raise RuntimeError(self._connect_hint()) from exc
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Ollama returned {exc.response.status_code}: {exc.response.text[:200]}"
+            ) from exc
+        yield StreamEvent(done=True, model=model, input_tokens=in_tok, output_tokens=out_tok)
+
+    def _connect_hint(self) -> str:
+        s = get_settings()
+        return (
+            f"Could not reach Ollama at {s.ollama_base_url}. "
+            f"Is `ollama serve` running and have you pulled `{s.ollama_model}` "
+            f"with `ollama pull {s.ollama_model}`?"
+        )
+
 
 class _GeminiProvider:
     """Google Gemini via google-generativeai SDK. Multi-turn via ChatSession."""
 
-    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+    def _start_chat(self, system: str, messages: list[Message]):
         import google.generativeai as genai  # lazy import
 
         s = get_settings()
@@ -132,16 +196,11 @@ class _GeminiProvider:
             raise RuntimeError(
                 "GEMINI_API_KEY is not set. Add it to .env or switch LLM_PROVIDER."
             )
-        genai.configure(api_key=s.gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name=s.gemini_model,
-            system_instruction=system,
-        )
-
-        # Replay all but the last message as chat history; send the last as the new turn.
-        # Gemini uses "model" instead of "assistant".
         if not messages:
             raise RuntimeError("Gemini provider received empty messages list.")
+        genai.configure(api_key=s.gemini_api_key)
+        model = genai.GenerativeModel(model_name=s.gemini_model, system_instruction=system)
+        # Replay all but the last message as chat history; send the last as the new turn.
         history = [
             {
                 "role": "user" if m["role"] == "user" else "model",
@@ -150,12 +209,13 @@ class _GeminiProvider:
             for m in messages[:-1]
         ]
         chat = model.start_chat(history=history)
-        response = chat.send_message(
-            messages[-1]["content"],
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=_MAX_OUTPUT_TOKENS
-            ),
-        )
+        gen_config = genai.types.GenerationConfig(max_output_tokens=_MAX_OUTPUT_TOKENS)
+        return chat, messages[-1]["content"], gen_config
+
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+        s = get_settings()
+        chat, last, gen_config = self._start_chat(system, messages)
+        response = chat.send_message(last, generation_config=gen_config)
         text = response.text.strip() if response.text else ""
 
         input_tokens = output_tokens = 0
@@ -171,11 +231,33 @@ class _GeminiProvider:
             output_tokens=output_tokens,
         )
 
+    def stream(self, system: str, messages: list[Message]) -> Iterator[StreamEvent]:
+        s = get_settings()
+        chat, last, gen_config = self._start_chat(system, messages)
+        response = chat.send_message(last, generation_config=gen_config, stream=True)
+        for chunk in response:
+            text = getattr(chunk, "text", "") or ""
+            if text:
+                yield StreamEvent(delta=text)
+        # Resolve the iterator so usage_metadata is populated.
+        try:
+            response.resolve()
+        except Exception:  # pragma: no cover — older SDK shapes
+            pass
+        in_tok = out_tok = 0
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            in_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+            out_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+        yield StreamEvent(
+            done=True, model=s.gemini_model, input_tokens=in_tok, output_tokens=out_tok
+        )
+
 
 class _AnthropicProvider:
-    """Anthropic Claude via the anthropic SDK. Native multi-turn support."""
+    """Anthropic Claude via the anthropic SDK. Native streaming + multi-turn."""
 
-    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+    def _client_and_args(self, system: str, messages: list[Message]):
         from anthropic import Anthropic  # lazy import
 
         s = get_settings()
@@ -184,19 +266,37 @@ class _AnthropicProvider:
                 "ANTHROPIC_API_KEY is not set. Add it to .env or switch LLM_PROVIDER."
             )
         client = Anthropic(api_key=s.anthropic_api_key)
-
-        response = client.messages.create(
+        kwargs = dict(
             model=s.anthropic_model,
             max_tokens=_MAX_OUTPUT_TOKENS,
             system=system,
             messages=[{"role": m["role"], "content": m["content"]} for m in messages],
         )
+        return client, kwargs
+
+    def complete(self, system: str, messages: list[Message]) -> ProviderResponse:
+        client, kwargs = self._client_and_args(system, messages)
+        response = client.messages.create(**kwargs)
         text = "".join(b.text for b in response.content if b.type == "text").strip()
         return ProviderResponse(
             text=text,
             model=response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+        )
+
+    def stream(self, system: str, messages: list[Message]) -> Iterator[StreamEvent]:
+        client, kwargs = self._client_and_args(system, messages)
+        with client.messages.stream(**kwargs) as s:
+            for text in s.text_stream:
+                if text:
+                    yield StreamEvent(delta=text)
+            final = s.get_final_message()
+        yield StreamEvent(
+            done=True,
+            model=final.model,
+            input_tokens=final.usage.input_tokens,
+            output_tokens=final.usage.output_tokens,
         )
 
 
@@ -268,6 +368,15 @@ def _build_messages(
     return msgs
 
 
+def _model_label_for_no_context() -> str:
+    s = get_settings()
+    return {
+        "ollama": s.ollama_model,
+        "gemini": s.gemini_model,
+        "anthropic": s.anthropic_model,
+    }.get(s.llm_provider, s.llm_provider)
+
+
 # ---------- Public API ----------
 
 
@@ -295,15 +404,10 @@ def generate_answer(
     settings = get_settings()
 
     if not chunks:
-        model_label = {
-            "ollama": settings.ollama_model,
-            "gemini": settings.gemini_model,
-            "anthropic": settings.anthropic_model,
-        }.get(settings.llm_provider, settings.llm_provider)
         return Answer(
             text=NO_CONTEXT_ANSWER,
             citations=[],
-            model=model_label,
+            model=_model_label_for_no_context(),
             input_tokens=0,
             output_tokens=0,
         )
@@ -328,3 +432,49 @@ def generate_answer(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
+
+
+def generate_answer_stream(
+    question: str,
+    chunks: list[RetrievedChunk],
+    history: list[Message] | None = None,
+) -> Iterator[StreamEvent]:
+    """Streaming counterpart of `generate_answer`.
+
+    Yields zero or more `StreamEvent(delta=...)` followed by exactly one terminal
+    `StreamEvent(done=True, model=..., input_tokens=..., output_tokens=...)`.
+
+    On empty `chunks`, the NO_CONTEXT_ANSWER is yielded as a single delta — the
+    provider is never called — so callers can treat both branches uniformly.
+    """
+    if not question or not question.strip():
+        raise ValueError("question must be a non-empty string")
+
+    if not chunks:
+        yield StreamEvent(delta=NO_CONTEXT_ANSWER)
+        yield StreamEvent(
+            done=True,
+            model=_model_label_for_no_context(),
+            input_tokens=0,
+            output_tokens=0,
+        )
+        return
+
+    provider = _get_provider()
+    messages = _build_messages(question, chunks, history)
+    saw_done = False
+    for event in provider.stream(SYSTEM_PROMPT, messages):
+        if event.done:
+            saw_done = True
+            logger.info(
+                "Streamed answer: provider=%s model=%s history_turns=%d in=%d out=%d",
+                get_settings().llm_provider,
+                event.model,
+                len(history or []),
+                event.input_tokens,
+                event.output_tokens,
+            )
+        yield event
+    if not saw_done:
+        # Defensive: providers should always terminate with done=True; synthesise one.
+        yield StreamEvent(done=True, model=_model_label_for_no_context())

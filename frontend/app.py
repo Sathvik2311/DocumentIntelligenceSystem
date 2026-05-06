@@ -9,8 +9,10 @@ Make sure uvicorn is running: `uvicorn backend.main:app --reload`.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +114,80 @@ def api_query(
         st.error(f"Query failed — {_format_error(r)}")
         return None
     return r.json()
+
+
+def stream_query(
+    question: str,
+    doc_ids: list[str] | None,
+    top_k: int,
+    retrieval_only: bool,
+    history: list[dict[str, Any]] | None,
+    use_hybrid: bool | None,
+    use_reranker: bool | None,
+    sink: dict[str, Any],
+) -> Iterator[str]:
+    """Stream tokens from POST /api/query/stream.
+
+    Yields plain-text deltas suitable for `st.write_stream`. Side effects:
+    populates `sink["citations"]`, `sink["usage"]`, `sink["error"]` as
+    non-token events arrive — read them once the generator is exhausted.
+    """
+    payload: dict[str, Any] = {
+        "question": question,
+        "top_k": top_k,
+        "retrieval_only": retrieval_only,
+    }
+    if doc_ids:
+        payload["doc_ids"] = list(doc_ids)
+    if use_hybrid is not None:
+        payload["use_hybrid"] = use_hybrid
+    if use_reranker is not None:
+        payload["use_reranker"] = use_reranker
+    if history:
+        payload["history"] = [
+            {"role": h["role"], "content": h["content"]}
+            for h in history[-MAX_HISTORY_TURNS:]
+            if h.get("role") in ("user", "assistant") and h.get("content")
+        ]
+
+    sink.setdefault("citations", [])
+    sink.setdefault("usage", {})
+    sink.setdefault("error", None)
+
+    cur_event: str | None = None
+    with _client() as c:
+        with c.stream("POST", "/api/query/stream", json=payload) as r:
+            if r.status_code != 200:
+                # Drain so we can show a useful error message.
+                body = r.read().decode("utf-8", errors="replace")
+                sink["error"] = f"{r.status_code}: {body[:200]}"
+                return
+            for raw in r.iter_lines():
+                if not raw:
+                    cur_event = None
+                    continue
+                line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                if line.startswith("event: "):
+                    cur_event = line[len("event: ") :].strip()
+                elif line.startswith("data: "):
+                    try:
+                        data = json.loads(line[len("data: ") :])
+                    except json.JSONDecodeError:
+                        continue
+                    if cur_event == "token":
+                        text = data.get("text") or ""
+                        if text:
+                            yield text
+                    elif cur_event == "citations":
+                        sink["citations"] = data.get("citations") or []
+                    elif cur_event == "done":
+                        sink["usage"] = {
+                            "model": data.get("model", ""),
+                            "input_tokens": int(data.get("input_tokens", 0)),
+                            "output_tokens": int(data.get("output_tokens", 0)),
+                        }
+                    elif cur_event == "error":
+                        sink["error"] = data.get("message") or "Unknown streaming error"
 
 
 CONFIDENCE_THRESHOLD = 0.30  # cosine sim below this is flagged as low confidence
@@ -398,42 +474,77 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        spinner_text = "Retrieving…" if retrieval_only else "Thinking…"
-        # Pass everything before the just-appended user turn as conversation history.
         prior_turns = history[:-1]
-        with st.spinner(spinner_text):
-            result = api_query(
+
+        if retrieval_only:
+            # No tokens to stream; the sync endpoint is simpler and identical UX.
+            with st.spinner("Retrieving…"):
+                result = api_query(
+                    question,
+                    doc_ids=scope_ids or None,
+                    top_k=top_k,
+                    retrieval_only=True,
+                    history=prior_turns,
+                    use_hybrid=use_hybrid,
+                    use_reranker=use_reranker,
+                )
+            if result is None:
+                history.append({"role": "assistant", "content": "_(error — see above)_"})
+            else:
+                st.markdown(result["answer"])
+                citations = result.get("citations", [])
+                _maybe_warn_low_confidence(citations)
+                _render_citations(citations, show_text=True)
+                usage = {
+                    "model": result["model"],
+                    "input_tokens": result["input_tokens"],
+                    "output_tokens": result["output_tokens"],
+                }
+                st.caption(f"_{usage['model']} · in 0 / out 0_")
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": result["answer"],
+                        "citations": citations,
+                        "usage": usage,
+                        "retrieval_only": True,
+                    }
+                )
+        else:
+            sink: dict[str, Any] = {}
+            stream_iter = stream_query(
                 question,
                 doc_ids=scope_ids or None,
                 top_k=top_k,
-                retrieval_only=retrieval_only,
+                retrieval_only=False,
                 history=prior_turns,
                 use_hybrid=use_hybrid,
                 use_reranker=use_reranker,
+                sink=sink,
             )
+            # st.write_stream renders incrementally and returns the concatenated text.
+            answer_text = st.write_stream(stream_iter)
 
-        if result is None:
-            # api_query already surfaced the error in red
-            history.append({"role": "assistant", "content": "_(error — see above)_"})
-        else:
-            st.markdown(result["answer"])
-            citations = result.get("citations", [])
-            _maybe_warn_low_confidence(citations)
-            _render_citations(citations, show_text=show_chunks or retrieval_only)
-            usage = {
-                "model": result["model"],
-                "input_tokens": result["input_tokens"],
-                "output_tokens": result["output_tokens"],
-            }
-            st.caption(
-                f"_{usage['model']} · in {usage['input_tokens']} / out {usage['output_tokens']}_"
-            )
-            history.append(
-                {
-                    "role": "assistant",
-                    "content": result["answer"],
-                    "citations": citations,
-                    "usage": usage,
-                    "retrieval_only": retrieval_only,
+            if sink.get("error"):
+                st.error(f"Streaming failed — {sink['error']}")
+                history.append({"role": "assistant", "content": "_(error — see above)_"})
+            else:
+                citations = sink.get("citations", [])
+                _maybe_warn_low_confidence(citations)
+                _render_citations(citations, show_text=show_chunks)
+                usage = sink.get("usage", {}) or {
+                    "model": "(unknown)", "input_tokens": 0, "output_tokens": 0,
                 }
-            )
+                st.caption(
+                    f"_{usage.get('model','?')} · "
+                    f"in {usage.get('input_tokens',0)} / out {usage.get('output_tokens',0)}_"
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": answer_text or "",
+                        "citations": citations,
+                        "usage": usage,
+                        "retrieval_only": False,
+                    }
+                )
