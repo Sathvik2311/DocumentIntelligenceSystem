@@ -13,10 +13,12 @@ from backend.services.generation import (
     Answer,
     Message,
     ProviderResponse,
+    StreamEvent,
     _build_messages,
     _build_user_message,
     _format_context,
     generate_answer,
+    generate_answer_stream,
 )
 from backend.services.ingestion import ingest_document
 from backend.services.retrieval import RetrievedChunk, retrieve
@@ -37,6 +39,15 @@ class _FakeProvider:
             model="fake-model",
             input_tokens=42,
             output_tokens=7,
+        )
+
+    def stream(self, system: str, messages: list[Message]):
+        self.last_system = system
+        self.last_messages = messages
+        for token in ["canned ", "answer ", "[1]"]:
+            yield StreamEvent(delta=token)
+        yield StreamEvent(
+            done=True, model="fake-model", input_tokens=42, output_tokens=7
         )
 
 
@@ -163,6 +174,42 @@ def test_build_user_message_includes_question_and_context() -> None:
     msg = _build_user_message("q?", chunks)
     assert msg.startswith("Context:")
     assert "Question: q?" in msg
+
+
+# ---------- Streaming ----------
+
+
+def test_stream_yields_deltas_then_done(
+    fake_provider: _FakeProvider, sample_pdf: Path
+) -> None:
+    ingest_document(sample_pdf)
+    chunks = retrieve("hello world", top_k=2)
+
+    events = list(generate_answer_stream("q?", chunks))
+    deltas = [e.delta for e in events if not e.done]
+    dones = [e for e in events if e.done]
+
+    assert "".join(deltas) == "canned answer [1]"
+    assert len(dones) == 1
+    assert dones[0].model == "fake-model"
+    assert dones[0].input_tokens == 42
+    assert dones[0].output_tokens == 7
+    # Provider was called with the new question.
+    assert fake_provider.last_messages is not None
+    assert "q?" in fake_provider.last_messages[-1]["content"]
+
+
+def test_stream_empty_chunks_skips_provider(fake_provider: _FakeProvider) -> None:
+    events = list(generate_answer_stream("anything", chunks=[]))
+    assert "".join(e.delta for e in events if not e.done) == NO_CONTEXT_ANSWER
+    assert events[-1].done is True
+    assert events[-1].input_tokens == 0
+    assert fake_provider.last_messages is None  # provider untouched
+
+
+def test_stream_empty_question_raises() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        list(generate_answer_stream("   ", chunks=[]))
 
 
 def test_build_messages_appends_new_question_last() -> None:
