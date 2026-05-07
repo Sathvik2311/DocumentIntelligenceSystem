@@ -14,6 +14,10 @@ class DocumentMetadata(BaseModel):
     filename: str
     num_chunks: int = Field(..., ge=0)
     num_pages: int = Field(..., ge=0)
+    summary: str | None = Field(
+        default=None,
+        description="2-3 sentence TL;DR generated at ingest time. None if disabled or failed.",
+    )
 
 
 class DocumentListResponse(BaseModel):
@@ -27,6 +31,10 @@ class UploadResponse(BaseModel):
     filename: str
     num_pages: int = Field(..., ge=0)
     num_chunks: int = Field(..., ge=0)
+    summary: str | None = Field(
+        default=None,
+        description="2-3 sentence TL;DR generated at ingest time. None if disabled or failed.",
+    )
 
 
 class DeleteResponse(BaseModel):

@@ -301,6 +301,8 @@ with st.sidebar:
                     f"Ingested **{result['filename']}** "
                     f"({result['num_pages']} pages → {result['num_chunks']} chunks)."
                 )
+                if result.get("summary"):
+                    st.info(f"📝 **TL;DR** — {result['summary']}")
                 st.session_state["_last_upload_sig"] = sig
                 st.rerun()
 
@@ -340,6 +342,7 @@ with st.sidebar:
                 f"{d['filename']}  ·  {d['num_chunks']} chunks",
                 value=default,
                 key=key,
+                help=d.get("summary") or None,
             )
             if checked:
                 selected.append(d["doc_id"])
@@ -355,6 +358,8 @@ with st.sidebar:
             for d in docs:
                 col1, col2 = st.columns([4, 1])
                 col1.write(f"**{d['filename']}**")
+                if d.get("summary"):
+                    col1.caption(d["summary"])
                 if col2.button("🗑", key=f"del-{d['doc_id']}", help="Delete this document"):
                     if api_delete(d["doc_id"]):
                         # Drop chat history for that doc, prune from selection,

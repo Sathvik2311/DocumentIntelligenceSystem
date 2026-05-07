@@ -156,3 +156,110 @@ def test_delete_document_removes_only_that_doc(
 def test_delete_unknown_doc_returns_zero(sample_txt: Path) -> None:
     ingest_document(sample_txt)
     assert delete_document("not-a-real-id") == 0
+
+
+# ---------- Auto-summary ----------
+
+
+class _SummaryFakeProvider:
+    """Captures the system + messages and returns a canned summary."""
+
+    def __init__(self, text: str = "This is a TL;DR.") -> None:
+        self.text = text
+        self.calls: list[tuple[str, list[dict]]] = []
+
+    def complete(self, system, messages):
+        from backend.services.generation import ProviderResponse
+        self.calls.append((system, list(messages)))
+        return ProviderResponse(text=self.text, model="fake", input_tokens=5, output_tokens=3)
+
+    def stream(self, system, messages):  # pragma: no cover — unused for summary
+        from backend.services.generation import StreamEvent
+        yield StreamEvent(done=True, model="fake")
+
+
+@pytest.fixture
+def summary_provider(monkeypatch: pytest.MonkeyPatch) -> _SummaryFakeProvider:
+    from backend.services import generation
+    fake = _SummaryFakeProvider()
+    generation._get_provider.cache_clear()
+    monkeypatch.setattr(generation, "_get_provider", lambda: fake)
+    monkeypatch.setenv("ENABLE_AUTO_SUMMARY", "true")
+    # Settings is cached; clear so the new env var takes effect.
+    from backend import config as _config
+    _config.get_settings.cache_clear()
+    return fake
+
+
+def test_ingest_persists_summary_when_enabled(
+    summary_provider: _SummaryFakeProvider, sample_pdf: Path
+) -> None:
+    from backend.services.ingestion import get_summary
+
+    result = ingest_document(sample_pdf)
+    assert result.summary == "This is a TL;DR."
+    assert get_summary(result.doc_id) == "This is a TL;DR."
+    # Summary system prompt was used (not the QA prompt).
+    assert summary_provider.calls
+    system, _msgs = summary_provider.calls[0]
+    assert "summarizer" in system.lower()
+
+
+def test_list_documents_includes_summary(
+    summary_provider: _SummaryFakeProvider, sample_pdf: Path
+) -> None:
+    result = ingest_document(sample_pdf)
+    docs = list_documents()
+    found = next(d for d in docs if d.doc_id == result.doc_id)
+    assert found.summary == "This is a TL;DR."
+
+
+def test_delete_removes_summary(
+    summary_provider: _SummaryFakeProvider, sample_pdf: Path
+) -> None:
+    from backend.services.ingestion import get_summary
+
+    result = ingest_document(sample_pdf)
+    assert get_summary(result.doc_id) is not None
+    delete_document(result.doc_id)
+    assert get_summary(result.doc_id) is None
+
+
+def test_summary_disabled_skips_provider(sample_pdf: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Auto-summary is OFF by default in conftest. Confirm provider is never invoked.
+    from backend.services import generation
+    from backend.services.ingestion import get_summary
+
+    fake = _SummaryFakeProvider()
+    generation._get_provider.cache_clear()
+    monkeypatch.setattr(generation, "_get_provider", lambda: fake)
+
+    result = ingest_document(sample_pdf)
+    assert result.summary is None
+    assert get_summary(result.doc_id) is None
+    assert fake.calls == []
+
+
+def test_summary_provider_failure_does_not_block_ingestion(
+    sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backend.services import generation
+    from backend.services.ingestion import get_summary
+
+    class _Boom:
+        def complete(self, system, messages):
+            raise RuntimeError("provider down")
+
+        def stream(self, system, messages):  # pragma: no cover
+            raise RuntimeError("provider down")
+
+    generation._get_provider.cache_clear()
+    monkeypatch.setattr(generation, "_get_provider", lambda: _Boom())
+    monkeypatch.setenv("ENABLE_AUTO_SUMMARY", "true")
+    from backend import config as _config
+    _config.get_settings.cache_clear()
+
+    result = ingest_document(sample_pdf)
+    assert result.num_chunks > 0  # ingestion succeeded
+    assert result.summary is None
+    assert get_summary(result.doc_id) is None

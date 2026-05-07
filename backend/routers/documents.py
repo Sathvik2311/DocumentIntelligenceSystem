@@ -65,6 +65,7 @@ async def upload(file: UploadFile = File(...)) -> UploadResponse:
         filename=result.filename,
         num_pages=result.num_pages,
         num_chunks=result.num_chunks,
+        summary=result.summary,
     )
 
 
@@ -78,6 +79,7 @@ async def list_all() -> DocumentListResponse:
                 filename=s.filename,
                 num_chunks=s.num_chunks,
                 num_pages=s.num_pages,
+                summary=s.summary,
             )
             for s in summaries
         ]
