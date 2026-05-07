@@ -56,6 +56,16 @@ class Settings(BaseSettings):
     )
     reranker_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+    # --- Auto-summary on upload ---
+    enable_auto_summary: bool = Field(
+        default=True,
+        description="Generate a 2-3 sentence TL;DR via the active LLM at ingest time.",
+    )
+    summary_input_chars: int = Field(
+        default=6000,
+        description="How many characters of the document head to send to the summariser.",
+    )
+
     log_level: str = Field(default="INFO")
 
 
