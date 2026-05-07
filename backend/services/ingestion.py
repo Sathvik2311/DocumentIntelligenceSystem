@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -163,6 +164,78 @@ class IngestResult:
     filename: str
     num_pages: int
     num_chunks: int
+    summary: str | None = None
+
+
+# ---------- Document summaries (sidecar JSON, keyed by doc_id) ----------
+
+
+def _summaries_path() -> Path:
+    return Path(get_settings().chroma_persist_dir) / "summaries.json"
+
+
+def _load_summaries() -> dict[str, str]:
+    p = _summaries_path()
+    if not p.is_file():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read summaries sidecar at %s; treating as empty.", p)
+        return {}
+
+
+def _write_summaries(data: dict[str, str]) -> None:
+    p = _summaries_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(p)
+
+
+def get_summary(doc_id: str) -> str | None:
+    """Return the persisted summary for `doc_id`, or None if missing."""
+    return _load_summaries().get(doc_id)
+
+
+def _set_summary(doc_id: str, summary: str) -> None:
+    data = _load_summaries()
+    data[doc_id] = summary
+    _write_summaries(data)
+
+
+def _remove_summary(doc_id: str) -> None:
+    data = _load_summaries()
+    if doc_id in data:
+        data.pop(doc_id)
+        _write_summaries(data)
+
+
+def _maybe_summarize(parsed: ParsedDocument) -> str | None:
+    """Generate a TL;DR for `parsed` if auto-summary is enabled.
+
+    Returns None on a clean opt-out, an empty string if there was no text to send,
+    and the model output otherwise. Provider errors are caught and logged so a
+    transient LLM outage never blocks ingestion.
+    """
+    settings = get_settings()
+    if not settings.enable_auto_summary:
+        return None
+    text = "\n\n".join(p.text for p in parsed.pages).strip()
+    if not text:
+        return ""
+    head = text[: settings.summary_input_chars]
+    # Lazy import to keep ingestion importable in environments without an LLM provider.
+    try:
+        from backend.services.generation import summarize_text
+        summary = summarize_text(head)
+    except Exception as exc:  # noqa: BLE001 — summary is best-effort
+        logger.warning("Auto-summary failed for %s: %s", parsed.filename, exc)
+        return None
+    return summary or None
 
 
 def get_embedder() -> SentenceTransformer:
@@ -215,12 +288,25 @@ def store_chunks(chunks: list[DocumentChunk]) -> int:
 
 
 def ingest_document(path: str | Path, doc_id: str | None = None) -> IngestResult:
-    """Full pipeline: parse -> chunk -> embed -> persist."""
+    """Full pipeline: parse -> chunk -> embed -> persist (+ best-effort summary)."""
     parsed = parse_document(path, doc_id = doc_id)
     chunks = chunk_document(parsed)
     stored = store_chunks(chunks)
-    return IngestResult(doc_id = parsed.doc_id, filename = parsed.filename, num_pages = len(parsed.pages),
-        num_chunks = stored, )
+
+    summary: str | None = None
+    if stored:
+        summary = _maybe_summarize(parsed)
+        if summary:
+            _set_summary(parsed.doc_id, summary)
+            logger.info("Stored auto-summary for %s (%d chars)", parsed.filename, len(summary))
+
+    return IngestResult(
+        doc_id = parsed.doc_id,
+        filename = parsed.filename,
+        num_pages = len(parsed.pages),
+        num_chunks = stored,
+        summary = summary,
+    )
 
 
 @dataclass(frozen=True)
@@ -231,6 +317,7 @@ class DocumentSummary:
     filename: str
     num_chunks: int
     num_pages: int
+    summary: str | None = None
 
 
 def list_documents() -> list[DocumentSummary]:
@@ -252,12 +339,14 @@ def list_documents() -> list[DocumentSummary]:
         entry["chunks"] += 1
         entry["max_page"] = max(entry["max_page"], int(meta.get("page_number", 0)))
 
+    stored_summaries = _load_summaries()
     summaries = [
         DocumentSummary(
             doc_id=doc_id,
             filename=v["filename"],
             num_chunks=v["chunks"],
             num_pages=v["max_page"],
+            summary=stored_summaries.get(doc_id),
         )
         for doc_id, v in by_doc.items()
     ]
@@ -274,6 +363,7 @@ def delete_document(doc_id: str) -> int:
         return 0
     collection.delete(where={"doc_id": doc_id})
     logger.info("Deleted %d chunks for doc_id=%s", n, doc_id)
+    _remove_summary(doc_id)
     from backend.services import bm25 as _bm25
     _bm25.mark_dirty()
     return n
