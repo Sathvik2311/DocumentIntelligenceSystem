@@ -45,6 +45,13 @@ NO_CONTEXT_ANSWER = (
 
 _MAX_OUTPUT_TOKENS = 1024
 
+SUMMARY_SYSTEM_PROMPT = (
+    "You are a concise document summarizer. Given the opening pages of a document, "
+    "produce a 2-3 sentence TL;DR that captures (1) what the document is, (2) its "
+    "subject or purpose, and (3) any key entity (person, company, project) it centers on. "
+    "Reply with the summary only — no preamble, no markdown, no bullet points."
+)
+
 
 class Message(TypedDict):
     role: str  # "user" | "assistant"
@@ -432,6 +439,21 @@ def generate_answer(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
+
+
+def summarize_text(text: str) -> str:
+    """Generate a 2-3 sentence TL;DR of `text` via the active LLM provider.
+
+    Returns an empty string if `text` is empty. Raises whatever the provider raises
+    on transport errors — callers decide whether to swallow them (e.g. ingestion
+    treats a summary failure as non-fatal).
+    """
+    if not text or not text.strip():
+        return ""
+    provider = _get_provider()
+    messages: list[Message] = [{"role": "user", "content": text}]
+    result = provider.complete(SUMMARY_SYSTEM_PROMPT, messages)
+    return result.text.strip()
 
 
 def generate_answer_stream(
