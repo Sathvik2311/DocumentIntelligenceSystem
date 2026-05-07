@@ -23,6 +23,8 @@ def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     monkeypatch.setenv("LLM_PROVIDER", "ollama")  # default; tests that hit LLM mock the provider
     # Don't trigger the real cross-encoder download in CI; reranker tests opt in.
     monkeypatch.setenv("ENABLE_RERANKER", "false")
+    # Auto-summary calls the LLM at ingest time; opt-in per test to keep ingestion offline.
+    monkeypatch.setenv("ENABLE_AUTO_SUMMARY", "false")
 
     # Drop cached settings + module-level Chroma client/collection/embedder so each test
     # builds them from scratch against the new directory.
